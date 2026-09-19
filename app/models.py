@@ -4,11 +4,14 @@
 （位点越界、重复位点、切点数量等）在 :mod:`app.validation` 中完成，
 两者最终都输出统一结构的 422 响应。
 """
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
 SampleName = Literal["reference", "variant"]
+
+# 条带长度 / 匹配容差：非负有限浮点数（JSON 整数自动转换）
+NonNegativeBand = Annotated[float, Field(ge=0, allow_inf_nan=False)]
 
 
 # ---------------------------------------------------------------- 输入模型
@@ -121,3 +124,46 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     service: str
     version: str
+
+
+# ---------------------------------------------------------------- 鉴别（identify）模型
+
+class IdentifyRequest(BaseModel):
+    reference_bands: list[NonNegativeBand] = Field(
+        default_factory=list, description="参考型预测条带长度列表（bp）"
+    )
+    variant_bands: list[NonNegativeBand] = Field(
+        default_factory=list, description="变异型预测条带长度列表（bp）"
+    )
+    observed_bands: list[NonNegativeBand] = Field(
+        ..., min_length=1, description="一次凝胶观测到的条带长度列表（bp），至少 1 条"
+    )
+    band_match_tolerance: NonNegativeBand = Field(
+        ..., description="条带匹配容差（bp）：长度差不超过该值的预测/观测条带才允许配对"
+    )
+
+
+class BandMatchOut(BaseModel):
+    predicted_length: float = Field(description="预测条带长度（bp）")
+    observed_length: float = Field(description="与之配对的观测条带长度（bp）")
+    error: float = Field(description="预测与观测长度差的绝对值（bp）")
+    description: str = Field(description="中文匹配依据说明")
+
+
+class SampleMatchOut(BaseModel):
+    predicted_band_count: int
+    matched_count: int
+    missing_count: int = Field(description="缺失条带数：未在观测中找到配对的预测条带")
+    extra_count: int = Field(description="额外条带数：未匹配到任何预测条带的观测条带")
+    total_error: float = Field(description="全部匹配对的长度差之和（bp）")
+    matches: list[BandMatchOut] = Field(description="逐条匹配依据，按预测长度升序")
+    missing_bands: list[float] = Field(description="缺失条带：未匹配到观测的预测长度，升序")
+    extra_bands: list[float] = Field(description="额外条带：未匹配到预测的观测长度，升序")
+
+
+class IdentifyResponse(BaseModel):
+    band_match_tolerance: float
+    observed_band_count: int
+    samples: dict[SampleName, SampleMatchOut]
+    verdict: Literal["reference", "variant", "ambiguous"]
+    verdict_reason: str = Field(description="中文判定依据说明")

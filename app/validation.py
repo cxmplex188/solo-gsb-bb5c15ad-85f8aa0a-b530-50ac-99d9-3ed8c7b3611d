@@ -6,7 +6,7 @@
 from fastapi import HTTPException
 
 from app.config import settings
-from app.models import DigestRequest
+from app.models import DigestRequest, IdentifyRequest
 
 
 class DigestValidationError(HTTPException):
@@ -70,6 +70,26 @@ def validate_request(req: DigestRequest) -> DigestRequest:
                     "duplicate_site",
                 ))
 
+    if errors:
+        raise DigestValidationError(errors)
+    return req
+
+
+def validate_identify_request(req: IdentifyRequest) -> IdentifyRequest:
+    """identify 接口的语义校验：条带列表规模上限。
+
+    观测为空、条带为负、容差非法等基础字段约束由 Pydantic 模型直接拦截，
+    与此处一样输出统一结构的 422 响应。
+    """
+    errors: list[dict] = []
+    for field in ("reference_bands", "variant_bands", "observed_bands"):
+        bands = getattr(req, field)
+        if len(bands) > settings.MAX_BANDS:
+            errors.append(_err(
+                [field],
+                f"条带数量（{len(bands)}）超过允许上限 {settings.MAX_BANDS}",
+                "too_many_bands",
+            ))
     if errors:
         raise DigestValidationError(errors)
     return req

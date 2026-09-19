@@ -8,20 +8,25 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.digest import recommend
+from app.identify import identify
 from app.models import (
     DigestRequest,
     DigestResponse,
     HealthResponse,
+    IdentifyRequest,
+    IdentifyResponse,
 )
-from app.validation import DigestValidationError, validate_request
+from app.validation import DigestValidationError, validate_identify_request, validate_request
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 app = FastAPI(
     title="Circular DNA Double-Digest Discrimination Service",
     description=(
         "圆形（环状）DNA 双酶切鉴别服务：枚举不同酶对，按圆环相邻切点计算"
-        "参考型与变异型的片段长度，按分辨容差聚类条带，并推荐可区分两种样本的酶对。"
+        "参考型与变异型的片段长度，按分辨容差聚类条带，并推荐可区分两种样本的酶对；"
+        "也可将一次凝胶观测条带与两种样本的预测条带做一对一最小代价匹配，"
+        "判定观测样本为参考型、变异型或无法区分。"
     ),
     version=VERSION,
 )
@@ -62,6 +67,17 @@ async def health() -> HealthResponse:
 async def digest_recommend(req: DigestRequest) -> DigestResponse:
     validate_request(req)
     return recommend(req)
+
+
+@app.post(
+    "/api/v1/digest/identify",
+    response_model=IdentifyResponse,
+    tags=["digest"],
+    summary="将凝胶观测条带与两种样本的预测条带匹配，判定样本为参考型 / 变异型 / 无法区分",
+)
+async def digest_identify(req: IdentifyRequest) -> IdentifyResponse:
+    validate_identify_request(req)
+    return identify(req)
 
 
 if __name__ == "__main__":

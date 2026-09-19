@@ -229,3 +229,170 @@ def test_422_basic_field_constraints():
     ))
     # 正常对照
     assert res.status_code == 200
+
+
+# ---------------------------------------------------------------- 鉴别（identify）
+
+def _identify_payload(**kw):
+    payload = {
+        "reference_bands": [230, 320, 450],
+        "variant_bands": [200, 300, 500],
+        "observed_bands": [231, 318, 455],
+        "band_match_tolerance": 10,
+    }
+    payload.update(kw)
+    return payload
+
+
+def test_identify_reference_verdict():
+    res = client.post("/api/v1/digest/identify", json=_identify_payload())
+    assert res.status_code == 200
+    body = res.json()
+
+    assert body["verdict"] == "reference"
+    assert body["verdict_reason"]
+    assert body["observed_band_count"] == 3
+    assert body["band_match_tolerance"] == 10
+
+    ref = body["samples"]["reference"]
+    assert ref["predicted_band_count"] == 3
+    assert ref["matched_count"] == 3
+    assert ref["missing_count"] == 0 and ref["extra_count"] == 0
+    assert ref["missing_bands"] == [] and ref["extra_bands"] == []
+    assert ref["total_error"] == 8  # 1 + 2 + 5
+
+    # 逐条匹配依据：按预测长度升序，误差与说明齐全
+    assert [m["predicted_length"] for m in ref["matches"]] == [230, 320, 450]
+    for m in ref["matches"]:
+        assert m["error"] == abs(m["predicted_length"] - m["observed_length"])
+        assert m["description"]
+
+    var = body["samples"]["variant"]
+    assert var["matched_count"] == 0
+    assert var["missing_bands"] == [200, 300, 500]
+    assert var["extra_bands"] == [231, 318, 455]
+    assert var["total_error"] == 0
+
+
+def test_identify_variant_verdict():
+    body = client.post("/api/v1/digest/identify", json=_identify_payload(
+        observed_bands=[205, 298, 502],
+    )).json()
+    assert body["verdict"] == "variant"
+    assert body["samples"]["variant"]["matched_count"] == 3
+    assert body["samples"]["reference"]["matched_count"] == 0
+
+
+def test_identify_ambiguous_when_samples_equally_good():
+    body = client.post("/api/v1/digest/identify", json=_identify_payload(
+        variant_bands=[230, 320, 450],
+    )).json()
+    assert body["verdict"] == "ambiguous"
+    assert "无法区分" in body["verdict_reason"]
+
+
+def test_identify_one_to_one_and_order_independent():
+    # 观测乱序、两条预测争一条观测：一对一匹配，且结果与提交顺序无关
+    first = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference_bands=[102, 100],
+        variant_bands=[900],
+        observed_bands=[101],
+        band_match_tolerance=5,
+    )).json()
+    ref = first["samples"]["reference"]
+    assert ref["matched_count"] == 1
+    assert ref["matches"][0]["predicted_length"] == 100
+    assert ref["missing_bands"] == [102]
+    var = first["samples"]["variant"]
+    assert var["missing_bands"] == [900]
+    assert var["extra_bands"] == [101]
+    assert first["verdict"] == "reference"
+
+    second = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference_bands=[100, 102],
+        variant_bands=[900],
+        observed_bands=[101],
+        band_match_tolerance=5,
+    )).json()
+    assert first == second
+
+
+def test_identify_counts_are_consistent():
+    body = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference_bands=[230, 320, 450, 700],
+        observed_bands=[231, 318, 455, 900],
+    )).json()
+    for sample in ("reference", "variant"):
+        s = body["samples"][sample]
+        assert s["matched_count"] == len(s["matches"])
+        assert s["matched_count"] + s["missing_count"] == s["predicted_band_count"]
+        assert s["matched_count"] + s["extra_count"] == body["observed_band_count"]
+        assert s["missing_count"] == len(s["missing_bands"])
+        assert s["extra_count"] == len(s["extra_bands"])
+
+
+def test_identify_float_bands():
+    body = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference_bands=[100, 200],
+        variant_bands=[150],
+        observed_bands=[100.4, 199.6],
+        band_match_tolerance=1,
+    )).json()
+    ref = body["samples"]["reference"]
+    assert ref["matched_count"] == 2
+    assert ref["total_error"] == 0.8
+    assert body["verdict"] == "reference"
+
+
+def test_identify_empty_prediction_lists_allowed():
+    # 参考/变异预测列表可为空（全部观测计为额外条带），两者一致则无法区分
+    body = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference_bands=[], variant_bands=[],
+    )).json()
+    assert body["verdict"] == "ambiguous"
+    assert body["samples"]["reference"]["extra_bands"] == [231, 318, 455]
+
+
+# ---------------------------------------------------------------- identify 422 校验
+
+def _expect_identify_422(payload, code_part=None):
+    res = client.post("/api/v1/digest/identify", json=payload)
+    assert res.status_code == 422
+    body = res.json()
+    assert body["code"] == "validation_failed"
+    assert body["errors"]
+    if code_part:
+        assert any(code_part in e["type"] for e in body["errors"])
+    return body
+
+
+def test_identify_422_empty_observed():
+    body = _expect_identify_422(_identify_payload(observed_bands=[]))
+    assert any("observed_bands" in e["loc"] for e in body["errors"])
+
+
+def test_identify_422_negative_band():
+    _expect_identify_422(_identify_payload(observed_bands=[100, -5]))
+    _expect_identify_422(_identify_payload(reference_bands=[-1]))
+    _expect_identify_422(_identify_payload(variant_bands=[-1]))
+
+
+def test_identify_422_invalid_tolerance():
+    _expect_identify_422(_identify_payload(band_match_tolerance=-1))
+    _expect_identify_422(_identify_payload(band_match_tolerance="wide"))
+    _expect_identify_422(_identify_payload(band_match_tolerance=None))
+
+
+def test_identify_422_missing_required_fields():
+    # 缺观测列表或缺容差
+    _expect_identify_422({"reference_bands": [100], "band_match_tolerance": 10})
+    _expect_identify_422({"observed_bands": [100]})
+    _expect_identify_422({})
+
+
+def test_identify_422_too_many_bands(monkeypatch):
+    from app.config import settings
+    monkeypatch.setattr(settings, "MAX_BANDS", 4)
+    _expect_identify_422(
+        _identify_payload(observed_bands=[1, 2, 3, 4, 5]), "too_many_bands",
+    )

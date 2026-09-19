@@ -11,5 +11,8 @@ class Settings:
     # 单次请求允许提交的最大酶数量，避免组合枚举过大
     MAX_ENZYMES: int = int(os.getenv("MAX_ENZYMES", "64"))
 
+    # identify 接口每个条带列表允许的最大条带数，控制匹配 DP 的规模
+    MAX_BANDS: int = int(os.getenv("MAX_BANDS", "512"))
+
 
 settings = Settings()

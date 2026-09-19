@@ -8,12 +8,19 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.digest import recommend
+from app.identify import identify
 from app.models import (
     DigestRequest,
     DigestResponse,
     HealthResponse,
+    IdentifyRequest,
+    IdentifyResponse,
 )
-from app.validation import DigestValidationError, validate_request
+from app.validation import (
+    DigestValidationError,
+    validate_identify,
+    validate_request,
+)
 
 VERSION = "1.0.0"
 
@@ -62,6 +69,17 @@ async def health() -> HealthResponse:
 async def digest_recommend(req: DigestRequest) -> DigestResponse:
     validate_request(req)
     return recommend(req)
+
+
+@app.post(
+    "/api/v1/digest/identify",
+    response_model=IdentifyResponse,
+    tags=["digest"],
+    summary="凝胶观测条带与参考型/变异型预测条带的一对一匹配鉴别",
+)
+async def digest_identify(req: IdentifyRequest) -> IdentifyResponse:
+    validate_identify(req)
+    return identify(req)
 
 
 if __name__ == "__main__":

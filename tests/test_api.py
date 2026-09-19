@@ -229,3 +229,162 @@ def test_422_basic_field_constraints():
     ))
     # 正常对照
     assert res.status_code == 200
+
+
+# ---------------------------------------------------------------- 凝胶鉴别
+
+def _identify_payload(reference=None, variant=None, observed=None, tolerance=20):
+    return {
+        "reference_bands": [100, 300, 500] if reference is None else reference,
+        "variant_bands": [120, 320, 600] if variant is None else variant,
+        "observed_bands": [102, 298, 505] if observed is None else observed,
+        "tolerance": tolerance,
+    }
+
+
+def test_identify_reference_decision_with_pair_details():
+    res = client.post("/api/v1/digest/identify", json=_identify_payload())
+    assert res.status_code == 200
+    body = res.json()
+    assert body["decision"] == "reference"
+    assert body["tolerance"] == 20
+
+    ref, var = body["reference"], body["variant"]
+    assert ref["sample"] == "reference" and var["sample"] == "variant"
+    assert ref["matched_count"] == 3
+    assert ref["missing_band_count"] == 0 and ref["extra_band_count"] == 0
+    assert ref["total_error"] == 9
+    assert len(ref["matches"]) == 3
+    # 逐条匹配依据
+    pairs = {(m["predicted"], m["observed"]) for m in ref["matches"]}
+    assert pairs == {(100, 102), (300, 298), (500, 505)}
+    assert all(m["within_tolerance"] for m in ref["matches"])
+    assert all("bp" in m["description"] for m in ref["matches"])
+    # 变异型容差内仅能配 1 对（320 与 298 差 22、600 与 505 差 95 均超容差）
+    assert var["matched_count"] == 1
+    assert var["missing_bands"] == [320, 600]
+    assert var["extra_bands"] == [298, 505]
+    assert "参考型" in body["reasoning"]
+
+
+def test_identify_variant_decision():
+    res = client.post("/api/v1/digest/identify", json=_identify_payload(
+        observed=[122, 318, 595],
+    ))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["decision"] == "variant"
+
+
+def test_identify_reports_missing_and_extra_bands():
+    # 观测只覆盖参考型部分条带，并多出一条；变异型几乎无法匹配
+    res = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference=[100, 300, 500],
+        variant=[700, 800, 900],
+        observed=[100, 505, 999],
+        tolerance=20,
+    ))
+    body = res.json()
+    assert body["decision"] == "reference"
+    ref = body["reference"]
+    assert ref["missing_bands"] == [300]
+    assert ref["extra_bands"] == [999]
+    assert ref["missing_band_count"] == 1 and ref["extra_band_count"] == 1
+    assert ref["matched_count"] == 2
+    var = body["variant"]
+    assert var["matched_count"] == 0
+    assert var["missing_bands"] == [700, 800, 900]
+    assert var["extra_bands"] == [100, 505, 999]
+
+
+def test_identify_ambiguous_when_equal_metrics():
+    # 观测恰在两种预测中间，未匹配数与总误差完全相同
+    res = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference=[100], variant=[102], observed=[101], tolerance=5,
+    ))
+    body = res.json()
+    assert body["decision"] == "ambiguous"
+    assert body["reference"]["total_error"] == body["variant"]["total_error"] == 1
+
+
+def test_identify_empty_predicted_lists_allowed():
+    # 预测列表允许为空（全部观测记为额外条带）
+    res = client.post("/api/v1/digest/identify", json=_identify_payload(
+        reference=[], variant=[], observed=[100, 200],
+    ))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["decision"] == "ambiguous"
+    assert body["reference"]["extra_bands"] == [100, 200]
+    assert body["variant"]["extra_bands"] == [100, 200]
+
+
+def _expect_identify_422(payload, code_part=None):
+    res = client.post("/api/v1/digest/identify", json=payload)
+    assert res.status_code == 422
+    body = res.json()
+    assert body["code"] == "validation_failed"
+    assert body["errors"]
+    if code_part:
+        assert any(code_part in e["type"] for e in body["errors"])
+    return body
+
+
+def test_identify_422_empty_observed():
+    _expect_identify_422(_identify_payload(observed=[]))
+
+
+def test_identify_422_negative_band_lengths():
+    _expect_identify_422(_identify_payload(observed=[100, -5]))
+    _expect_identify_422(_identify_payload(reference=[100, -1]))
+    _expect_identify_422(_identify_payload(variant=[-3.5]))
+
+
+def test_identify_422_invalid_tolerance():
+    _expect_identify_422(_identify_payload(tolerance=-1))
+
+
+def test_identify_422_non_finite_values():
+    import json
+
+    # NaN / Infinity 不是合法 JSON 数字，用 json.dumps 的 allow_nan 手工构造
+    raw = _identify_payload(tolerance=float("inf"))
+    res = client.post(
+        "/api/v1/digest/identify",
+        content=json.dumps(raw, allow_nan=True),
+        headers={"Content-Type": "application/json"},
+    )
+    assert res.status_code == 422
+    body = res.json()
+    # Infinity 能通过 ge 约束，由语义校验拒绝
+    assert any("tolerance_invalid" in e["type"] for e in body["errors"])
+
+    raw = _identify_payload(observed=[100, float("nan")])
+    res = client.post(
+        "/api/v1/digest/identify",
+        content=json.dumps(raw, allow_nan=True),
+        headers={"Content-Type": "application/json"},
+    )
+    assert res.status_code == 422
+    body = res.json()
+    # NaN 可能被 ge 约束（greater_than_equal）或语义校验（band_length_invalid）拒绝
+    types = [e["type"] for e in body["errors"]]
+    assert any("band_length_invalid" in t or "greater_than_equal" in t for t in types)
+
+
+def test_identify_422_missing_and_wrong_type_fields():
+    payload = _identify_payload()
+    del payload["observed_bands"]
+    _expect_identify_422(payload)
+    _expect_identify_422({
+        "reference_bands": [100], "variant_bands": [100],
+        "observed_bands": "100,200", "tolerance": 10,
+    })
+
+
+def test_identify_422_uses_same_error_envelope_as_recommend():
+    res = client.post("/api/v1/digest/identify", json=_identify_payload(observed=[]))
+    body = res.json()
+    # 与推荐接口统一的 422 结构
+    assert set(body.keys()) == {"code", "errors"}
+    assert all(set(e.keys()) >= {"loc", "msg", "type"} for e in body["errors"])

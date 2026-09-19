@@ -3,10 +3,12 @@
 校验失败统一抛出 :class:`DigestValidationError`，由主应用转换为
 统一结构的 HTTP 422 响应（与 Pydantic 字段校验同一响应格式）。
 """
+import math
+
 from fastapi import HTTPException
 
 from app.config import settings
-from app.models import DigestRequest
+from app.models import DigestRequest, IdentifyRequest
 
 
 class DigestValidationError(HTTPException):
@@ -69,6 +71,40 @@ def validate_request(req: DigestRequest) -> DigestRequest:
                     f"中存在重复切点 {dupes}",
                     "duplicate_site",
                 ))
+
+    if errors:
+        raise DigestValidationError(errors)
+    return req
+
+
+def validate_identify(req: IdentifyRequest) -> IdentifyRequest:
+    """凝胶鉴别请求的语义校验：容差与条带长度必须为有限数值。
+
+    观测为空、任意条带为负等由 Pydantic 字段约束（min_length / ge）拦截；
+    NaN 能通过比较类约束、Infinity 能通过 ge 约束，在此统一拒绝。
+    """
+    errors: list[dict] = []
+
+    if not math.isfinite(req.tolerance):
+        errors.append(_err(
+            ["tolerance"],
+            f"容差（{req.tolerance}）必须为有限、非负的数值",
+            "tolerance_invalid",
+        ))
+
+    for field, label in (
+        ("reference_bands", "参考型预测条带"),
+        ("variant_bands", "变异型预测条带"),
+        ("observed_bands", "观测条带"),
+    ):
+        values = getattr(req, field)
+        non_finite = [v for v in values if not math.isfinite(v)]
+        if non_finite:
+            errors.append(_err(
+                [field],
+                f"{label}长度存在 NaN / Infinity 等非有限数值：{non_finite}",
+                "band_length_invalid",
+            ))
 
     if errors:
         raise DigestValidationError(errors)

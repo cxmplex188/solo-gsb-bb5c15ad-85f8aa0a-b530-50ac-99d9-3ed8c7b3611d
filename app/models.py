@@ -4,11 +4,14 @@
 （位点越界、重复位点、切点数量等）在 :mod:`app.validation` 中完成，
 两者最终都输出统一结构的 422 响应。
 """
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
 SampleName = Literal["reference", "variant"]
+
+# 条带长度（bp）：非负浮点；NaN / Infinity 在语义校验中进一步拒绝
+BandLength = Annotated[float, Field(ge=0)]
 
 
 # ---------------------------------------------------------------- 输入模型
@@ -32,6 +35,23 @@ class DigestRequest(BaseModel):
         ..., ge=0, description="条带分辨容差（bp），长度差不超过该值的相邻片段聚为同一条带"
     )
     enzymes: list[EnzymeInput] = Field(..., min_length=2, description="参与枚举的酶，至少 2 种")
+
+
+# ------------------------------------------------- 凝胶条带鉴别（identify）
+
+class IdentifyRequest(BaseModel):
+    reference_bands: list[BandLength] = Field(
+        ..., description="参考型预测条带长度（bp），允许为空列表"
+    )
+    variant_bands: list[BandLength] = Field(
+        ..., description="变异型预测条带长度（bp），允许为空列表"
+    )
+    observed_bands: list[BandLength] = Field(
+        ..., min_length=1, description="一次凝胶实验观测到的条带长度（bp），不可为空、不可含负数"
+    )
+    tolerance: float = Field(
+        ..., ge=0, description="匹配容差（bp）：预测与观测长度差 ≤ 该值才允许配对，必须为有限值"
+    )
 
 
 # ---------------------------------------------------------------- 输出模型
@@ -121,3 +141,35 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
     service: str
     version: str
+
+
+# ------------------------------------------------- identify 输出模型
+
+class BandMatchOut(BaseModel):
+    predicted: float = Field(description="预测条带长度（bp）")
+    observed: float = Field(description="与之配对的观测条带长度（bp）")
+    error: float = Field(description="绝对长度差（bp）")
+    within_tolerance: bool = Field(description="长度差是否不超过容差")
+    description: str = Field(description="中文配对依据说明")
+
+
+class SampleIdentificationOut(BaseModel):
+    sample: SampleName
+    matched_count: int = Field(description="成功一对一配对的条带数")
+    missing_band_count: int = Field(description="预测到但凝胶上缺失的条带数")
+    extra_band_count: int = Field(description="凝胶上多出、无预测对应的观测条带数")
+    total_error: float = Field(description="全部配对的绝对长度差之和（bp）")
+    matches: list[BandMatchOut]
+    missing_bands: list[float] = Field(description="未被任何观测条带匹配上的预测长度")
+    extra_bands: list[float] = Field(description="未被任何预测条带匹配上的观测长度")
+
+
+class IdentifyResponse(BaseModel):
+    tolerance: float
+    decision: Literal["reference", "variant", "ambiguous"] = Field(
+        description="reference：观测更符合参考型；variant：更符合变异型。"
+                    "先比缺失+额外条带总数，再比总误差，两者均相同为 ambiguous"
+    )
+    reference: SampleIdentificationOut
+    variant: SampleIdentificationOut
+    reasoning: str = Field(description="中文判定依据说明")

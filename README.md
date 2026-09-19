@@ -1,6 +1,9 @@
 # 环状 DNA 双酶切鉴别服务
 
-基于 FastAPI 的圆形（环状）DNA 双酶切方案推荐服务：客户端提交质粒长度、参考型与变异型的候选酶切位点、最小可见片段长度和条带分辨容差，服务枚举所有不同酶对，按圆环相邻切点计算两种样本的片段长度，将容差内的片段聚为同一条电泳条带，并推荐能够区分两种样本的酶对。
+基于 FastAPI 的圆形（环状）DNA 双酶切方案推荐与凝胶条带鉴别服务：
+
+- **方案推荐**：客户端提交质粒长度、参考型与变异型的候选酶切位点、最小可见片段长度和条带分辨容差，服务枚举所有不同酶对，按圆环相邻切点计算两种样本的片段长度，将容差内的片段聚为同一条电泳条带，并推荐能够区分两种样本的酶对。
+- **凝胶鉴别**（`POST /api/v1/digest/identify`）：客户端提交同一质粒的参考型、变异型**预测条带长度**及**一次凝胶观测长度列表**，服务在给定容差内做确定性一对一最小代价匹配，分别计算两种样本的缺失、额外条带和总误差，返回 `reference` / `variant` / `ambiguous` 判定及逐条匹配依据。
 
 **核心功能为纯本地数学计算，不依赖数据库、缓存或任何外部服务。**
 
@@ -14,12 +17,18 @@
 docker compose up --build -d
 ```
 
-服务启动后监听 **`http://localhost:8000`**。
+服务启动后监听 **`http://localhost:8000`**，两个接口（`/api/v1/digest/recommend` 与 `/api/v1/digest/identify`）均由同一服务提供，无需额外容器或环境变量。
 
 停止：
 
 ```bash
 docker compose down
+```
+
+修改代码后重建镜像：
+
+```bash
+docker compose up --build -d
 ```
 
 ### 不使用 Docker（本地 Python 3.11+）
@@ -37,6 +46,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | 健康检查 | GET | `http://localhost:8000/health` |
 | 双酶切方案推荐 | POST | `http://localhost:8000/api/v1/digest/recommend` |
+| 凝胶观测条带鉴别 | POST | `http://localhost:8000/api/v1/digest/identify` |
 | 交互式 API 文档（Swagger） | GET | `http://localhost:8000/docs` |
 | OpenAPI Schema | GET | `http://localhost:8000/openapi.json` |
 
@@ -117,18 +127,82 @@ curl -X POST http://localhost:8000/api/v1/digest/recommend \
 
 ---
 
+## 凝胶条带鉴别：`POST /api/v1/digest/identify`
+
+对同一质粒的两种预测（参考型、变异型）与**同一次凝胶实验观测**做比对，判定观测更接近哪种样本。
+
+### 请求体（JSON）
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `reference_bands` | number[] | 参考型预测条带长度（bp），允许为空列表；每项 ≥ 0 |
+| `variant_bands` | number[] | 变异型预测条带长度（bp），允许为空列表；每项 ≥ 0 |
+| `observed_bands` | number[] | 一次凝胶观测到的条带长度（bp），**不可为空**；每项 ≥ 0 |
+| `tolerance` | number | 匹配容差（bp），必须为有限、非负数；长度差 `≤ tolerance` 才允许配对 |
+
+请求示例见 [`examples/identify.json`](examples/identify.json)：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/digest/identify \
+  -H 'Content-Type: application/json' \
+  -d @examples/identify.json
+```
+
+### 匹配与判定算法
+
+对参考型、变异型分别执行同一次匹配（两个样本共用 `observed_bands`，互不影响）：
+
+1. **可行边**：预测条带 `p` 与观测条带 `o` 仅在 `|p - o| ≤ tolerance` 时可以配对；
+2. **一对一约束**：每条预测条带、每条观测条带至多参与一次配对；
+3. **最小代价匹配**：以绝对长度差为边权，先最大化容差内配对数，再在配对数相同的方案中最小化总绝对误差（匈牙利算法求最小权二分图匹配，复杂度 O(k³)）；
+4. **缺失条带**：预测到但未匹配上观测的条带（`missing_bands`，凝胶上应有而未见）；**额外条带**：观测到但无预测可匹配的条带（`extra_bands`，凝胶上多出）；
+5. **确定性**：所有长度列表先排序后匹配，结果只取决于输入数值，与列表原始顺序无关。
+
+两种样本完成匹配后按以下优先级比较，给出 `decision`：
+
+- 先比 **未匹配条带总数 = 缺失数 + 额外数**（容差内解释的条带越多越优）；
+- 未匹配数相同，再比 **总误差 `total_error`**（全部配对绝对长度差之和）；
+- 两者仍相同为 `ambiguous`。
+
+> 说明：不能只比较配对误差——否则一个一条都没配上的样本也会以 0 误差与完全吻合的样本打平，产生退化判定。
+
+### 响应要点
+
+- `decision`：`reference` / `variant` / `ambiguous`；
+- `reference` / `variant`：两种样本各自的匹配结果
+  - `matches`：**逐条配对依据**（预测长度、观测长度、绝对误差、是否在容差内、中文说明）；
+  - `missing_bands` / `extra_bands` 及对应计数；
+  - `matched_count` / `total_error`；
+- `reasoning`：中文判定依据（双方未匹配数与总误差的对比）。
+
+示例请求（容差 20 bp，观测 `[102, 298, 505]`）的判定结果为 `reference`：参考型 3 条全部配对、总误差 9 bp；变异型仅 `120 ↔ 102`（误差 18）可配，缺失 `[320, 600]`、额外 `[298, 505]`。
+
+### 拒绝条件（HTTP 422）
+
+与推荐接口共用统一结构 `{"code":"validation_failed","errors":[...]}`：
+
+- `observed_bands` 为空列表（预测列表允许为空，观测列表不允许）；
+- 任一条带长度为负数（含预测列表与观测列表）；
+- `tolerance` 为负数，或为 `NaN` / `Infinity` 等非有限值；条带长度为非有限值同样拒绝；
+- 缺少必填字段、字段类型错误等 Pydantic 校验错误。
+
+---
+
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 入口：健康检查、推荐路由、统一 422 处理
+│   ├── main.py          # FastAPI 入口：健康检查、推荐/鉴别路由、统一 422 处理
 │   ├── models.py        # 请求/响应 Pydantic 模型
-│   ├── validation.py    # 越界、重复位点等语义校验
+│   ├── validation.py    # 越界、重复位点、非有限值等语义校验
 │   ├── digest.py        # 圆环片段、条带聚类、酶对枚举与排序（纯函数）
+│   ├── identify.py      # 预测/观测条带的容差内一对一最小代价匹配（纯函数）
 │   └── config.py        # 环境变量配置（均有默认值）
 ├── tests/               # pytest 单元 + API 端到端测试
-├── examples/request.json
+├── examples/
+│   ├── request.json     # 方案推荐示例请求
+│   └── identify.json    # 凝胶鉴别示例请求
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
